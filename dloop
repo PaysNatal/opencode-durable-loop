@@ -3,8 +3,15 @@
 # Ensures the Temporal dev server + worker are running, then starts a LoopWorkflow.
 set -euo pipefail
 
-# Resolve paths relative to this script so the project is portable (clone anywhere).
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve the REAL path of this script (follow symlinks) so the project stays
+# portable even when dloop is symlinked into ~/.local/bin.
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 LOOP_DIR="${DLOOP_LOOP_DIR:-$SCRIPT_DIR/loop}"
 TEMPORAL_ADDR="${DLOOP_TEMPORAL_ADDR:-localhost:7233}"
 NAMESPACE="${DLOOP_NAMESPACE:-loop}"
