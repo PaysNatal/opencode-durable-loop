@@ -49,6 +49,11 @@ async def main():
         help="Memorix vault for shared lessons (default ~/memory-vault; falls back to lessons.jsonl if not a git repo)",
     )
     p.add_argument(
+        "--keep-sessions",
+        action="store_true",
+        help="Keep the cluster's opencode sessions (default deletes them to avoid garbage)",
+    )
+    p.add_argument(
         "--detach",
         action="store_true",
         help="Start and return immediately (workflow runs durably in background)",
@@ -65,6 +70,7 @@ async def main():
         poll_interval_sec=args.poll_interval_sec,
         max_stall_polls=args.max_stall_polls,
         memory_vault=args.memory_vault,
+        clean_sessions=not args.keep_sessions,
     )
 
     client = await Client.connect("localhost:7233", namespace="loop")

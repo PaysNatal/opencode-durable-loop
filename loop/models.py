@@ -24,6 +24,9 @@ class LoopParams:
     memory_vault: str = (
         "~/memory-vault"  # memorix vault for shared lessons (fallback: lessons.jsonl)
     )
+    clean_sessions: bool = (
+        True  # delete the cluster's opencode sessions after it finishes (anti-garbage)
+    )
 
 
 @dataclass
@@ -35,6 +38,9 @@ class RunClusterInput:
     flags: list[str] = field(default_factory=list)
     poll_interval_sec: int = 15
     max_stall_polls: int = 8
+    clean_sessions: bool = (
+        True  # delete the cluster's opencode sessions when it finishes
+    )
 
 
 # Terminal cluster states (zeroshot).

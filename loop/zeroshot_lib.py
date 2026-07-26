@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 from typing import Optional
 
@@ -75,3 +76,46 @@ async def get_max_validator_iteration(cluster_id: str, cwd: str) -> int:
 
 async def kill_cluster(cluster_id: str, cwd: str) -> None:
     await _run(["zeroshot", "kill", cluster_id], cwd)
+
+
+async def cleanup_cluster_sessions(cluster_id: str) -> int:
+    """Delete opencode sessions created in the cluster's worktree (loop garbage).
+
+    Each zeroshot cluster runs opencode (conductor/planner/worker/validators)
+    inside ~/.zeroshot/worktrees/<cluster-id>; those sessions linger in
+    opencode.db after the cluster finishes. This removes them so the session
+    store doesn't fill up. Best-effort: never raises, returns count deleted.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9-]+", cluster_id or ""):
+        return 0  # sanity guard against SQL injection via cluster_id
+    db = os.path.expanduser("~/.local/share/opencode/opencode.db")
+    if not os.path.exists(db):
+        return 0
+    pattern = f"%/.zeroshot/worktrees/{cluster_id}%"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sqlite3",
+            db,
+            f"SELECT id FROM session WHERE directory LIKE '{pattern}';",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        ids = [
+            ln.strip() for ln in out.decode(errors="replace").splitlines() if ln.strip()
+        ]
+        deleted = 0
+        for sid in ids:
+            p = await asyncio.create_subprocess_exec(
+                "opencode",
+                "session",
+                "delete",
+                sid,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await p.communicate()
+            deleted += 1
+        return deleted
+    except Exception:
+        return 0

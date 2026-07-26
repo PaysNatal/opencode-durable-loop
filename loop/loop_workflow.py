@@ -149,35 +149,34 @@ async def run_cluster(inp: RunClusterInput) -> ClusterOutcome:
         # Heartbeat reports the cluster id (for reattach) + progress. Synchronous in 1.30.0.
         activity.heartbeat(cluster_id, state, tokens)
 
+        outcome = None
         if state in TERMINAL_STATES or state in FAILURE_STATES:
             failure_info = ""
             if state in FAILURE_STATES:
                 failure_info = await zeroshot_lib.get_failure_info(cluster_id, cwd)
-            return ClusterOutcome(
+            outcome = ClusterOutcome(
                 cluster_id=cluster_id,
                 state=state,
                 tokens=tokens,
                 failure_info=failure_info,
             )
-
-        if state == "":
+        elif state == "":
             # Cluster vanished from the list (killed/cleaned externally).
-            return ClusterOutcome(
+            outcome = ClusterOutcome(
                 cluster_id=cluster_id,
                 state="lost",
                 tokens=tokens,
                 failure_info="cluster disappeared from list",
             )
-
-        # Stall detection: zero token progress after work began.
-        if tokens > 0 and tokens == last_tokens:
+        elif tokens > 0 and tokens == last_tokens:
+            # Stall detection: zero token progress after work began.
             stall += 1
             if stall >= inp.max_stall_polls:
                 activity.logger.warning(
                     "STALL: %s zero progress for %d polls — killing", cluster_id, stall
                 )
                 await zeroshot_lib.kill_cluster(cluster_id, cwd)
-                return ClusterOutcome(
+                outcome = ClusterOutcome(
                     cluster_id=cluster_id,
                     state="stalled",
                     tokens=tokens,
@@ -186,6 +185,18 @@ async def run_cluster(inp: RunClusterInput) -> ClusterOutcome:
         else:
             stall = 0
             last_tokens = tokens
+
+        if outcome is not None:
+            # Anti-garbage: delete this cluster's opencode sessions now that it's done.
+            if inp.clean_sessions:
+                deleted = await zeroshot_lib.cleanup_cluster_sessions(cluster_id)
+                if deleted:
+                    activity.logger.info(
+                        "Cleaned up %d opencode session(s) for cluster %s",
+                        deleted,
+                        cluster_id,
+                    )
+            return outcome
 
         await asyncio.sleep(inp.poll_interval_sec)
 
@@ -320,6 +331,7 @@ class LoopWorkflow:
                     flags=params.flags,
                     poll_interval_sec=params.poll_interval_sec,
                     max_stall_polls=params.max_stall_polls,
+                    clean_sessions=params.clean_sessions,
                 ),
                 start_to_close_timeout=timedelta(minutes=params.run_timeout_min),
                 heartbeat_timeout=timedelta(seconds=params.heartbeat_timeout_sec),
