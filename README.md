@@ -148,8 +148,11 @@ zeroshot 本来设计了一个兜底机制 `reformatOutput`（用一个 LLM 把�
 补丁修改 `src/agent/output-reformatter.js`，`install.sh` 会自动应用（幂等，已打则跳过）。
 
 ### ⚠️ 升级会被覆盖
-补丁打在全局 npm 包上。**`npm update @the-open-engine/zeroshot` 会覆盖它**。升级后需重跑 `./scripts/apply-zeroshot-patch.sh`。
-（原始文件备份在 `<zeroshot>/src/agent/output-reformatter.js.bak`。建议把此修复提 upstream PR 治本。）
+补丁打在全局 npm 包上。**`npm update @the-open-engine/zeroshot` 会覆盖它**。
+此修复已提交 upstream PR：[the-open-engine/zeroshot#803](https://github.com/the-open-engine/zeroshot/pull/803)。
+- **合并后**：`npm update` 即原生包含修复，无需再打补丁。
+- **合并前**：升级后需重跑 `./scripts/apply-zeroshot-patch.sh`。
+（原始文件备份在 `<zeroshot>/src/agent/output-reformatter.js.bak`。）
 
 ---
 
