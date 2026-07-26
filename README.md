@@ -120,6 +120,7 @@ temporal workflow result  --workflow-id <id> --namespace loop   # 阻塞等结�
 | `--run-timeout-min N` | 单次集群运行超时（分钟） | 30 |
 | `--heartbeat-timeout-sec N` | 心跳超时（超过无心跳判卡死） | 90 |
 | `--memory-vault DIR` | memorix 记忆库 | `~/memory-vault` |
+| `--keep-sessions` | 保留集群的 opencode 会话（默认自动删除，避免垃圾堆积） | 关（自动清理） |
 | `--detach` | 发后即走（持久后台运行） | 关（前台等结果） |
 
 ### 轻量备选（无 Temporal）
@@ -204,7 +205,8 @@ opencode-durable-loop/
 │   └── loop-agent.txt            # opencode loop agent 提示词
 ├── scripts/
 │   ├── install.sh                # 一键安装
-│   └── apply-zeroshot-patch.sh   # 应用 zeroshot 补丁
+│   ├── apply-zeroshot-patch.sh   # 应用 zeroshot 补丁
+│   └── clean-sessions.sh         # 清理 loop 留下的 opencode 会话垃圾
 ├── tests/
 │   └── test_memorix_lib.py       # memorix 往返测试
 └── docs/
@@ -229,6 +231,13 @@ opencode-durable-loop/
 
 **Q: memorix 教训没生效？**
 确认 `~/memory-vault` 是 git 仓库（memorix 要求 git 作用域）。否则会自动降级到本地 `lessons.jsonl`。
+
+**Q: opencode 的 sessions 被 loop 塞满了垃圾？**
+每个集群会在 `~/.zeroshot/worktrees/<id>` 里跑 opencode（conductor/planner/worker/validator），
+这些会话会留在 `opencode.db` 里。本项目的处理：
+- **自动**：`run_cluster` 在集群跑完后自动删除该集群的 opencode 会话（`--keep-sessions` 可关闭）。
+- **手动清历史垃圾**：`./scripts/clean-sessions.sh`（只删 worktree 已不存在的孤儿会话，安全；
+  `--dry-run` 预览，`--all` 清全部 worktree 会话）。
 
 **Q: 想看某个 workflow 的完整执行历史？**
 `temporal workflow show --workflow-id <id> --namespace loop`。
