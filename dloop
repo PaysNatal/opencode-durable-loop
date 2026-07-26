@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# dloop — durable loop: run a task on the Temporal-backed executor-verifier loop.
+# Ensures the Temporal dev server + worker are running, then starts a LoopWorkflow.
+set -euo pipefail
+
+# Resolve paths relative to this script so the project is portable (clone anywhere).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOOP_DIR="${DLOOP_LOOP_DIR:-$SCRIPT_DIR/loop}"
+TEMPORAL_ADDR="${DLOOP_TEMPORAL_ADDR:-localhost:7233}"
+NAMESPACE="${DLOOP_NAMESPACE:-loop}"
+DB_DIR="${DLOOP_DB_DIR:-$HOME/.temporal-dev}"
+DB_FILE="$DB_DIR/temporal.db"
+
+CYAN='\033[0;36m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+info() { echo -e "${CYAN}▸ $*${NC}"; }
+ok()   { echo -e "${GREEN}✓ $*${NC}"; }
+warn() { echo -e "${YELLOW}⚠ $*${NC}"; }
+
+usage() {
+  cat <<'EOF'
+dloop — durable loop (Temporal-backed executor-verifier loop)
+
+Usage:
+  dloop "task description" [dloop options] [-- zeroshot flags...]
+
+dloop options:
+  --project-dir DIR          Project dir (zeroshot cwd + lessons). Default: $PWD
+  --max-iterations N         Max executor-verifier iterations (default 3)
+  --run-timeout-min N        Per-run timeout in minutes (default 30)
+  --heartbeat-timeout-sec N  Heartbeat timeout in seconds (default 90)
+  --memory-vault DIR         Memorix vault for shared lessons (default ~/memory-vault)
+  --detach                   Start and return immediately (runs durably in background)
+  --flag <zeroshot-flag>     Extra zeroshot flag, repeatable (or use '--' below)
+
+  -- <zeroshot flags...>     Everything after '--' is passed verbatim to zeroshot
+                             (e.g. --worktree --provider opencode)
+
+Examples:
+  dloop "Refactor auth to support OAuth" --detach -- --worktree --provider opencode
+  dloop "Add payment webhook" --max-iterations 5 -- --worktree
+  dloop "Long migration task" --detach
+
+Monitoring (any time, from any terminal):
+  temporal workflow list --namespace loop
+  temporal workflow describe --workflow-id <id> --namespace loop
+  temporal workflow result --workflow-id <id> --namespace loop   # wait for the result
+EOF
+}
+
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+[[ -z "${1:-}" ]] && { usage; exit 1; }
+
+# ── 1. Ensure Temporal server is running ────────────────────────────────
+if temporal operator cluster health --address "$TEMPORAL_ADDR" &>/dev/null; then
+  ok "Temporal server running"
+else
+  info "Starting Temporal dev server..."
+  mkdir -p "$DB_DIR"
+  nohup temporal server start-dev --db-filename "$DB_FILE" --namespace "$NAMESPACE" \
+    --headless --port 7233 > "$DB_DIR/server.log" 2>&1 &
+  disown
+  up=false
+  for _ in $(seq 1 30); do
+    if temporal operator cluster health --address "$TEMPORAL_ADDR" &>/dev/null; then up=true; break; fi
+    sleep 1
+  done
+  [[ "$up" == true ]] && ok "Temporal server up" || { warn "Temporal server failed to start (see $DB_DIR/server.log)"; exit 1; }
+fi
+
+# ── 2. Ensure loop worker is running ────────────────────────────────────
+if pgrep -f "loop_worker.py" &>/dev/null; then
+  ok "Loop worker running"
+else
+  info "Starting loop worker..."
+  ( cd "$LOOP_DIR" && nohup python3 loop_worker.py > worker.log 2>&1 & disown )
+  up=false
+  for _ in $(seq 1 15); do
+    if pgrep -f "loop_worker.py" &>/dev/null; then up=true; break; fi
+    sleep 1
+  done
+  [[ "$up" == true ]] && ok "Loop worker up" || { warn "Worker failed to start (see $LOOP_DIR/worker.log)"; exit 1; }
+fi
+
+# ── 3. Start the workflow ───────────────────────────────────────────────
+cd "$LOOP_DIR"
+exec python3 loop_start.py "$@"

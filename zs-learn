@@ -1,0 +1,925 @@
+#!/usr/bin/env bash
+# zs-learn — Failure Learning Layer for Zeroshot
+# Wraps `zeroshot run` with cross-run lesson injection and failure extraction.
+# Dependencies: bash 4+, jq, zeroshot (global install)
+#
+# Usage:
+#   zs-learn loop                             Interactive mode: just type tasks (background)
+#   zs-learn run "task" [zeroshot flags...]   Run one task (BACKGROUND by default; --fg for fg)
+#   zs-learn harvest                          Reap lessons from finished failed clusters
+#   zs-learn dry-run "task" [flags...]        Show injected context without running
+#   zs-learn lessons [--all]                  List unresolved (or all) lessons
+#   zs-learn resolve <id>                     Mark a lesson as resolved
+#   zs-learn clear                            Delete all lessons for this project
+#   zs-learn help                             Show this help
+
+set -euo pipefail
+
+# ── Config ──────────────────────────────────────────────────────────────
+LESSONS_DIR=".zeroshot"
+LESSONS_FILE="${LESSONS_DIR}/lessons.jsonl"
+PENDING_FILE="${LESSONS_DIR}/pending.jsonl"     # write-ahead log of launched runs (durable capture)
+BREAKER_FILE="${LESSONS_DIR}/breaker.json"      # circuit-breaker state for infra failures
+MAX_INJECT=10          # max unresolved lessons to inject
+MAX_LINE_LEN=160       # truncate each lesson line to this many chars
+BREAKER_THRESHOLD=3    # consecutive infra failures before the breaker trips
+
+# ── Colors ──────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
+
+# ── Helpers ─────────────────────────────────────────────────────────────
+die()  { echo -e "${RED}✗ $*${NC}" >&2; exit 1; }
+info() { echo -e "${CYAN}▸ $*${NC}"; }
+ok()   { echo -e "${GREEN}✓ $*${NC}"; }
+warn() { echo -e "${YELLOW}⚠ $*${NC}"; }
+
+ensure_jq() { command -v jq &>/dev/null || die "jq is required. brew install jq"; }
+
+gen_id() {
+  # 4-char hex id, good enough for lesson dedup
+  od -An -tx2 -N2 /dev/urandom | tr -d ' '
+}
+
+now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+ensure_lessons_file() {
+  mkdir -p "$LESSONS_DIR"
+  touch "$LESSONS_FILE"
+}
+
+# ── Lesson CRUD ─────────────────────────────────────────────────────────
+
+count_unresolved() {
+  [[ -f "$LESSONS_FILE" ]] || { echo 0; return; }
+  jq -s '[.[] | select(.resolved == false)] | length' "$LESSONS_FILE" 2>/dev/null || echo 0
+}
+
+# Build the compact markdown block injected into the task prompt
+build_lesson_context() {
+  [[ -f "$LESSONS_FILE" ]] || return
+  local count
+  count=$(count_unresolved)
+  [[ "$count" -eq 0 ]] && return
+
+  local block=""
+  block+="## Prior Failures — do NOT repeat these mistakes"$'\n'
+  block+=""$'\n'
+
+  # Read unresolved lessons, most recent first, capped at MAX_INJECT
+  while IFS= read -r line; do
+    local cls task lesson
+    cls=$(echo "$line" | jq -r '.failure_class // "unknown"')
+    task=$(echo "$line" | jq -r '.task // "?"')
+    lesson=$(echo "$line" | jq -r '.lesson // .verifier_finding // "?"')
+    # Truncate long lessons
+    if [[ ${#lesson} -gt $MAX_LINE_LEN ]]; then
+      lesson="${lesson:0:$((MAX_LINE_LEN - 3))}..."
+    fi
+    block+="- [${cls}] ${task}: ${lesson}"$'\n'
+  done < <(jq -c -s '[.[] | select(.resolved == false)] | reverse | .[:'"$MAX_INJECT"'][]' "$LESSONS_FILE" 2>/dev/null)
+
+  echo "$block"
+}
+
+# Classify failure from verifier output using keyword heuristics
+classify_failure() {
+  local text="$1"
+  local lower
+  lower=$(echo "$text" | tr '[:upper:]' '[:lower:]')
+
+  if echo "$lower" | grep -qE 'import|require|module not found|package|dependency|version conflict|npm err|cannot find module'; then
+    echo "dependency"
+  elif echo "$lower" | grep -qE 'config|path|permission|denied|enoent|env|variable not set|\.env'; then
+    echo "config"
+  elif echo "$lower" | grep -qE 'test|assert|expect|spec|jest|vitest|pytest|mocha|fail.*test|test.*fail'; then
+    echo "test"
+  elif echo "$lower" | grep -qE 'regression|broke|was working|used to|previously|side.effect|broke.*other'; then
+    echo "regression"
+  elif echo "$lower" | grep -qE 'wrong approach|should use|instead of|better to|architecture|design|pattern'; then
+    echo "approach"
+  else
+    echo "logic"
+  fi
+}
+
+# Extract failure details from the latest zeroshot cluster
+extract_and_store_lesson() {
+  local task_desc="$1"
+  local target_id="${2:-}"
+
+  # Get the cluster: prefer the explicit id (detached runs know theirs),
+  # otherwise fall back to the most recent cluster.
+  local latest=""
+  if [[ -n "$target_id" ]]; then
+    latest=$(zeroshot list --json 2>/dev/null | jq -c --arg id "$target_id" '.clusters[]? | select(.id == $id) // empty' 2>/dev/null)
+  fi
+  if [[ -z "$latest" ]]; then
+    latest=$(zeroshot list --json 2>/dev/null | jq -c '.clusters[-1] // empty')
+  fi
+
+  if [[ -z "$latest" ]]; then
+    warn "No zeroshot cluster found — skipping lesson extraction"
+    return
+  fi
+
+  local cluster_id status
+  cluster_id=$(echo "$latest" | jq -r '.id // "?"')
+  # Clusters expose `.state` (stopped/failed/zombie/...); fall back to `.status`.
+  status=$(echo "$latest" | jq -r '.state // .status // "?"')
+
+  info "Cluster ${cluster_id}: state=${status}"
+
+  # Map cluster terminal states:
+  #   success → stopped (tasks completed); also approved/done/complete
+  #   failure → failed / zombie / corrupted / error / rejected  → capture a lesson
+  case "$status" in
+    stopped|approved|done|complete)
+      ok "Run completed cleanly — no lesson needed"
+      auto_resolve_matching "$task_desc"
+      return
+      ;;
+    failed|zombie|corrupted|error|rejected)
+      : # fall through to lesson extraction
+      ;;
+    *)
+      warn "Run ended with state '${status}' — no lesson extracted"
+      return
+      ;;
+  esac
+
+  # Extract verifier findings from the cluster transcript.
+  # `zeroshot export <id>` writes <id>.html and prints only a confirmation line,
+  # so read that HTML, strip tags to plain text, then delete the file.
+  local findings=""
+  local export_msg export_html
+  export_msg=$(zeroshot export "$cluster_id" 2>/dev/null || true)
+  export_html=$(echo "$export_msg" | { grep -oE 'Exported to .+' || true; } | sed 's/^Exported to //' | head -1)
+  [[ -z "$export_html" ]] && export_html="${cluster_id}.html"
+  if [[ -f "$export_html" ]]; then
+    findings=$( { sed -e 's/<[^>]*>/ /g' -e 's/&lt;/</g' -e 's/&gt;/>/g' \
+                      -e 's/&amp;/\&/g' -e 's/&quot;/"/g' -e "s/&#39;/'/g" \
+                      "$export_html" 2>/dev/null || true; } | tr -s ' \t\n' ' \n' | tail -120)
+    rm -f "$export_html"
+  fi
+  if [[ -z "$findings" ]]; then
+    findings=$(zeroshot status "$cluster_id" 2>/dev/null || true)
+  fi
+
+  # Truncate to reasonable size for classification
+  local findings_short
+  findings_short=$(echo "$findings" | head -50)
+
+  local failure_class
+  failure_class=$(classify_failure "$findings_short")
+
+  # Build the lesson record
+  local lesson_id
+  lesson_id=$(gen_id)
+
+  # Extract a one-line summary from findings
+  local root_cause
+  root_cause=$(echo "$findings_short" | grep -iE 'reject|fail|error|issue|problem|bug|missing|wrong' | head -1 | sed 's/^[[:space:]]*//' | cut -c1-200)
+  [[ -z "$root_cause" ]] && root_cause="See zeroshot export ${cluster_id} for details"
+
+  local lesson_text
+  lesson_text=$(echo "$findings_short" | grep -iE 'should|must|need|fix|change|use|avoid|instead|ensure|make sure' | head -1 | sed 's/^[[:space:]]*//' | cut -c1-200)
+  [[ -z "$lesson_text" ]] && lesson_text="$root_cause"
+
+  # Extract involved files if any
+  local files_json="[]"
+  local files_found
+  files_found=$(echo "$findings_short" | grep -oE '[a-zA-Z0-9_/.-]+\.(ts|js|tsx|jsx|py|go|rs|java|rb|sh|json|yaml|yml|toml|md)' | sort -u | head -5)
+  if [[ -n "$files_found" ]]; then
+    files_json=$(echo "$files_found" | jq -R . | jq -s .)
+  fi
+
+  # Write the lesson
+  ensure_lessons_file
+  jq -n \
+    --arg id "$lesson_id" \
+    --arg ts "$(now_iso)" \
+    --arg task "$task_desc" \
+    --arg fc "$failure_class" \
+    --arg vf "$root_cause" \
+    --arg rc "$root_cause" \
+    --arg ls "$lesson_text" \
+    --arg cid "$cluster_id" \
+    --argjson files "$files_json" \
+    '{id:$id, ts:$ts, task:$task, failure_class:$fc, verifier_finding:$vf, root_cause:$rc, lesson:$ls, cluster_id:$cid, files:$files, resolved:false}' \
+    >> "$LESSONS_FILE"
+
+  echo ""
+  warn "Lesson captured [${lesson_id}] class=${failure_class}"
+  echo -e "  ${DIM}task:   ${task_desc}${NC}"
+  echo -e "  ${DIM}cause:  ${root_cause}${NC}"
+  echo -e "  ${DIM}lesson: ${lesson_text}${NC}"
+}
+
+# Record a lesson for a STALLED cluster (watchdog killed it). Stalled clusters
+# have no useful verifier output, so write a dedicated 'stall' lesson directly.
+record_stall_lesson() {
+  local task_desc="$1"
+  local cluster_id="$2"
+  ensure_lessons_file
+  local lesson_id
+  lesson_id=$(gen_id)
+  jq -n \
+    --arg id "$lesson_id" \
+    --arg ts "$(now_iso)" \
+    --arg task "$task_desc" \
+    --arg cid "$cluster_id" \
+    '{id:$id, ts:$ts, task:$task, failure_class:"stall",
+      verifier_finding:("Cluster " + $cid + " made zero token progress and was killed by the watchdog"),
+      root_cause:"agent stalled / hung (zero token progress)",
+      lesson:"This task shape can hang the agent — break it into smaller steps and/or set a verification timeout",
+      cluster_id:$cid, files:[], resolved:false}' \
+    >> "$LESSONS_FILE"
+  echo ""
+  warn "Stall lesson captured [${lesson_id}] for cluster ${cluster_id}"
+}
+
+# ── Durable capture (②): write-ahead log + reconciliation ───────────────
+# Record a launched run BEFORE its outcome is known, so harvest can reconcile
+# it even if the foreground waiter dies. Decouples learning from process life.
+record_pending() {
+  local cluster_id="$1" task="$2"
+  ensure_lessons_file
+  jq -n --arg cid "$cluster_id" --arg task "$task" --arg ts "$(now_iso)" \
+    '{cluster_id:$cid, task:$task, ts:$ts, status:"pending"}' >> "$PENDING_FILE"
+}
+
+# Update a pending record's status (rewrite the JSONL in place, safely).
+mark_pending() {
+  local cluster_id="$1" new_status="$2"
+  [[ -f "$PENDING_FILE" ]] || return 0
+  local tmp; tmp=$(mktemp)
+  if jq -c --arg cid "$cluster_id" --arg st "$new_status" \
+      'if .cluster_id == $cid then .status = $st else . end' "$PENDING_FILE" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$PENDING_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+latest_cluster_id() {
+  zeroshot list --json 2>/dev/null | jq -r '.clusters[-1].id // empty' 2>/dev/null
+}
+
+# ── Error classification + circuit breaker (⑤) ──────────────────────────
+# Classify a cluster's failure text for INFRA errors (non-retryable).
+# Echoes: auth | permission | provider-missing | none
+classify_run_error() {
+  local lower; lower=$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')
+  if echo "$lower" | grep -qE 'not logged in|please run /login|please login|authentication|invalid api key|unauthorized|\b401\b'; then
+    echo "auth"
+  elif echo "$lower" | grep -qE 'permission denied|access denied|forbidden|eacces|\b403\b'; then
+    echo "permission"
+  elif echo "$lower" | grep -qE 'not found|no such file|command not found|provider.*(missing|unavailable)'; then
+    echo "provider-missing"
+  else
+    echo "none"
+  fi
+}
+
+# Circuit breaker: count consecutive infra failures; trip at BREAKER_THRESHOLD.
+breaker_record() {
+  local result="$1"   # "ok" | "fail"
+  ensure_lessons_file
+  local count=0 tripped=false
+  if [[ -f "$BREAKER_FILE" ]]; then
+    count=$(jq -r '.consecutive_failures // 0' "$BREAKER_FILE" 2>/dev/null || echo 0)
+  fi
+  if [[ "$result" == "ok" ]]; then
+    count=0
+  else
+    count=$((count + 1))
+    if [[ "$count" -ge "$BREAKER_THRESHOLD" ]]; then tripped=true; fi
+  fi
+  jq -n --argjson c "$count" --argjson t "$tripped" --arg ts "$(now_iso)" \
+    '{consecutive_failures:$c, tripped:$t, updated:$ts}' > "$BREAKER_FILE" 2>/dev/null || true
+  if [[ "$tripped" == "true" ]]; then
+    warn "🔴 CIRCUIT BREAKER TRIPPED: ${count} consecutive infra failures."
+    warn "   The provider is likely broken (not logged in / missing / no permission)."
+    warn "   Re-login or switch: zeroshot providers set-default <provider>"
+  fi
+}
+
+# ── Verification gate (④) ────────────────────────────────────────────────
+# A cluster that 'stopped' but ran NO validator is UNVERIFIED.
+# Returns 0 if a validator ran (verified), 1 otherwise.
+check_verified() {
+  local cluster_id="$1"
+  local max_iter
+  max_iter=$(zeroshot status "$cluster_id" --json 2>/dev/null \
+    | jq '[.agents[]? | select((.role // "") | test("validator")) | (.iteration // 0)] | max // 0' 2>/dev/null)
+  [[ -z "$max_iter" ]] && max_iter=0
+  [[ "$max_iter" -gt 0 ]]
+}
+
+# ── Specialized lesson writers ───────────────────────────────────────────
+record_infra_lesson() {
+  local task="$1" cluster_id="$2" err_class="$3" failure="$4"
+  ensure_lessons_file
+  local id; id=$(gen_id)
+  jq -n --arg id "$id" --arg ts "$(now_iso)" --arg task "$task" --arg cid "$cluster_id" \
+        --arg fc "$err_class" --arg vf "${failure:-<no detail>}" \
+    '{id:$id, ts:$ts, task:$task, failure_class:("infra-" + $fc),
+      verifier_finding:$vf, root_cause:("infrastructure error: " + $fc),
+      lesson:("Fix the provider (" + $fc + ") before retrying — not a task-logic problem"),
+      cluster_id:$cid, files:[], resolved:false}' >> "$LESSONS_FILE"
+  warn "Infra lesson captured [${id}] class=infra-${err_class}"
+}
+
+record_lost_note() {
+  local task="$1" cluster_id="$2"
+  ensure_lessons_file
+  local id; id=$(gen_id)
+  jq -n --arg id "$id" --arg ts "$(now_iso)" --arg task "$task" --arg cid "$cluster_id" \
+    '{id:$id, ts:$ts, task:$task, failure_class:"lost",
+      verifier_finding:("Cluster " + $cid + " was killed/cleaned before its outcome was reconciled"),
+      root_cause:"run outcome lost (cluster removed before reconciliation)",
+      lesson:"Run harvest BEFORE cleaning clusters; this run was never verified",
+      cluster_id:$cid, files:[], resolved:false}' >> "$LESSONS_FILE"
+}
+
+# ── Post-run analysis: ⑤ error class + ④ verification gate + lesson ──────
+post_run_analysis() {
+  local task="$1" cluster_id="$2"
+  [[ -z "$cluster_id" ]] && cluster_id=$(latest_cluster_id)
+  if [[ -z "$cluster_id" ]]; then
+    warn "No cluster found for post-run analysis"
+    return 0
+  fi
+  local status_json state failure
+  status_json=$(zeroshot status "$cluster_id" --json 2>/dev/null || true)
+  state=$(echo "$status_json" | jq -r '.state // "?"' 2>/dev/null)
+  failure=$(echo "$status_json" | jq -r '.failureInfo.error // ""' 2>/dev/null)
+  info "Post-run analysis: cluster ${cluster_id} state=${state}"
+
+  case "$state" in
+    stopped)
+      breaker_record "ok"
+      if check_verified "$cluster_id"; then
+        ok "Verification gate PASSED — a validator ran on this cluster."
+        auto_resolve_matching "$task"
+      else
+        warn "⚠ Verification gate: NO validator ran — result is UNVERIFIED."
+        warn "  Not treating as clean success. Verify the deliverable yourself."
+      fi
+      mark_pending "$cluster_id" "reconciled"
+      ;;
+    failed|zombie|corrupted|error|rejected)
+      local err_class; err_class=$(classify_run_error "$failure")
+      if [[ "$err_class" != "none" ]]; then
+        breaker_record "fail"
+        warn "🔴 INFRA ERROR (${err_class}): ${failure:-<no detail>}"
+        case "$err_class" in
+          auth)             warn "  → Re-login the provider (run its CLI, then /login), then retry." ;;
+          permission)       warn "  → Check the provider's permissions/credentials." ;;
+          provider-missing) warn "  → Provider not installed/found. Switch: zeroshot providers set-default <provider>" ;;
+        esac
+        record_infra_lesson "$task" "$cluster_id" "$err_class" "$failure"
+        mark_pending "$cluster_id" "infra-error"
+      else
+        breaker_record "ok"   # infra fine; the task itself failed
+        extract_and_store_lesson "$task" "$cluster_id"
+        mark_pending "$cluster_id" "reconciled"
+      fi
+      ;;
+    *)
+      warn "Run ended with state '${state}' — no lesson extracted"
+      ;;
+  esac
+}
+
+# ── Reconcile pending runs whose waiter may have died (② durable) ────────
+reconcile_pending() {
+  [[ -f "$PENDING_FILE" ]] || return 0
+  local pending
+  pending=$(jq -c 'select(.status == "pending")' "$PENDING_FILE" 2>/dev/null || true)
+  [[ -z "$pending" ]] && return 0
+  info "Reconciling pending runs (their waiter may have died before capturing lessons)..."
+  local p cid task cstate
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    cid=$(echo "$p" | jq -r '.cluster_id')
+    task=$(echo "$p" | jq -r '.task')
+    cstate=$(zeroshot list --json 2>/dev/null | jq -r --arg id "$cid" '.clusters[]? | select(.id==$id) | (.state // .status // "")' 2>/dev/null)
+    case "$cstate" in
+      stopped)
+        info "  ${cid}: finished OK → auto-resolving"
+        auto_resolve_matching "$task"
+        mark_pending "$cid" "reconciled"
+        ;;
+      failed|zombie|corrupted|error|rejected)
+        info "  ${cid}: finished FAILED → capturing lesson"
+        extract_and_store_lesson "$task" "$cid"
+        mark_pending "$cid" "reconciled"
+        ;;
+      "")
+        warn "  ${cid}: cluster gone (killed/cleaned) → recording as lost"
+        record_lost_note "$task" "$cid"
+        mark_pending "$cid" "lost"
+        ;;
+      *)
+        info "  ${cid}: still ${cstate} → leaving pending"
+        ;;
+    esac
+  done <<< "$pending"
+}
+
+# Auto-resolve lessons whose task overlaps with the approved task
+auto_resolve_matching() {
+  local task="$1"
+  [[ -f "$LESSONS_FILE" ]] || return
+
+  # Simple keyword overlap: if >50% of task words appear in a lesson's task, resolve it
+  local task_words
+  task_words=$(echo "$task" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '\n' | sort -u)
+  local total_words
+  total_words=$(echo "$task_words" | wc -l | tr -d ' ')
+  [[ "$total_words" -eq 0 ]] && return
+
+  local tmpfile
+  tmpfile=$(mktemp)
+  local resolved_count=0
+
+  while IFS= read -r line; do
+    local is_resolved lesson_task lesson_id
+    is_resolved=$(echo "$line" | jq -r '.resolved')
+    lesson_task=$(echo "$line" | jq -r '.task // ""')
+    lesson_id=$(echo "$line" | jq -r '.id')
+
+    if [[ "$is_resolved" == "true" ]]; then
+      echo "$line" >> "$tmpfile"
+      continue
+    fi
+
+    # Count overlapping words
+    local lesson_words overlap
+    lesson_words=$(echo "$lesson_task" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '\n' | sort -u)
+    overlap=$(comm -12 <(echo "$task_words") <(echo "$lesson_words") | wc -l | tr -d ' ')
+
+    if [[ "$overlap" -gt $((total_words / 2)) ]]; then
+      # Resolve it
+      echo "$line" | jq '.resolved = true' >> "$tmpfile"
+      resolved_count=$((resolved_count + 1))
+    else
+      echo "$line" >> "$tmpfile"
+    fi
+  done < "$LESSONS_FILE"
+
+  if [[ "$resolved_count" -gt 0 ]]; then
+    mv "$tmpfile" "$LESSONS_FILE"
+    ok "Auto-resolved ${resolved_count} lesson(s) matching the approved task"
+  else
+    rm -f "$tmpfile"
+  fi
+}
+
+# Wait for a detached cluster to reach a terminal state, so lesson extraction
+# runs against the FINAL outcome (not a still-running cluster).
+# Terminal cluster states: stopped, killed, failed, corrupted, zombie.
+wait_for_terminal() {
+  local cluster_id="$1"
+  local poll_interval="${2:-15}"
+  # ── Watchdog ──────────────────────────────────────────────────────────
+  # After work has begun (tokens>0), N consecutive polls with ZERO token
+  # progress => declare a stall (the agent hung). Tunable via env:
+  #   ZEROSHOT_STALL_POLLS  (default 8 → ~2 min at 15s interval)
+  #   ZEROSHOT_STALL_KILL   (1 = kill stalled cluster [default], 0 = warn only)
+  local max_stall_polls="${ZEROSHOT_STALL_POLLS:-8}"
+  local stall_kill="${ZEROSHOT_STALL_KILL:-1}"
+  info "Running in background. Polling every ${poll_interval}s until it finishes..."
+  info "  Ctrl+C stops waiting but the cluster KEEPS RUNNING — reattach: zeroshot attach ${cluster_id}"
+  info "  Watchdog: work begun + ${max_stall_polls} polls (~$((max_stall_polls * poll_interval))s) of zero token progress => stall"
+  local state="" tokens="" last_tokens="" stall=0
+  while true; do
+    local row
+    row=$(zeroshot list --json 2>/dev/null \
+      | jq -r --arg id "$cluster_id" '.clusters[]? | select(.id == $id) | "\(.state // .status // "")|\(.totalTokens // 0)"' 2>/dev/null)
+    state="${row%%|*}"
+    tokens="${row##*|}"
+    case "$state" in
+      stopped|killed|failed|corrupted|zombie)
+        echo ""
+        ok "Cluster ${cluster_id} finished (state=${state})"
+        return 0
+        ;;
+      "")
+        echo ""
+        warn "Cluster ${cluster_id} no longer listed — assuming finished"
+        return 0
+        ;;
+    esac
+    # ── Zero-progress stall detection (only once work has begun: tokens>0) ──
+    if [[ -n "$tokens" && "$tokens" != "0" && "$tokens" == "$last_tokens" ]]; then
+      stall=$((stall + 1))
+      if [[ "$stall" -ge "$max_stall_polls" ]]; then
+        echo ""
+        warn "🔴 STALL DETECTED: ${cluster_id} — zero token progress for ~$((stall * poll_interval))s (tokens stuck at ${tokens})"
+        if [[ "$stall_kill" == "1" ]]; then
+          warn "Killing stalled cluster (set ZEROSHOT_STALL_KILL=0 to only warn)..."
+          zeroshot kill "$cluster_id" >/dev/null 2>&1 || true
+        else
+          warn "Leaving cluster running (ZEROSHOT_STALL_KILL=0). Investigate: zeroshot attach ${cluster_id}"
+        fi
+        return 2   # 2 = stalled
+      fi
+    else
+      stall=0
+      [[ -n "$tokens" ]] && last_tokens="$tokens"
+    fi
+    printf '.'
+    sleep "$poll_interval"
+  done
+}
+
+# ── Commands ────────────────────────────────────────────────────────────
+
+cmd_run() {
+  ensure_jq
+  local task="${1:-}"
+  [[ -z "$task" ]] && die "Usage: zs-learn run \"task description\" [zeroshot flags...]"
+  shift
+
+  # ── Detach by default ─────────────────────────────────────────────────
+  # Loop mode is for ultra-long tasks → run in the BACKGROUND by default so
+  # your terminal stays free and nothing gets orphaned. Opt out with --fg.
+  local detach=true
+  local passthru=()
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --fg|--foreground|--no-detach) detach=false ;;
+      --detach|-d)                   detach=true ;;
+      *)                             passthru+=("$arg") ;;
+    esac
+  done
+
+  # Build lesson context
+  local lesson_ctx
+  lesson_ctx=$(build_lesson_context)
+
+  local full_task="$task"
+  if [[ -n "$lesson_ctx" ]]; then
+    local n
+    n=$(count_unresolved)
+    info "Injecting ${n} prior failure lesson(s) into task context"
+    full_task="${lesson_ctx}"$'\n'"---"$'\n\n'"${task}"
+  else
+    info "No prior failures — running clean"
+  fi
+
+  echo -e "${BOLD}▸ Starting zeroshot run...${NC}"
+  echo ""
+
+  local exit_code=0
+  local cluster_id=""
+  if [[ "$detach" == true ]]; then
+    # Background: zeroshot returns right after spawning the daemon.
+    local run_output
+    run_output=$(zeroshot run "$full_task" --detach ${passthru[@]+"${passthru[@]}"} 2>&1) || exit_code=$?
+    echo "$run_output"
+    cluster_id=$(echo "$run_output" | { grep -oE 'Started [a-zA-Z0-9-]+' || true; } | awk '{print $2}' | head -1)
+    if [[ -n "$cluster_id" ]]; then
+      echo ""
+      ok "Detached cluster: ${cluster_id}"
+      info "Live logs: zeroshot logs ${cluster_id} -f"
+      info "Attach:    zeroshot attach ${cluster_id}"
+      # ② Durable: write-ahead so harvest can reconcile even if we die waiting.
+      record_pending "$cluster_id" "$task"
+      # Wait for the FINAL state. Watchdog returns 2 if the cluster stalled.
+      local wait_rc=0
+      wait_for_terminal "$cluster_id" || wait_rc=$?
+      if [[ "$wait_rc" -eq 2 ]]; then
+        record_stall_lesson "$task" "$cluster_id"
+        mark_pending "$cluster_id" "stalled"
+        return
+      fi
+    else
+      warn "Could not parse cluster id — skipping wait & lesson extraction"
+      return
+    fi
+  else
+    # Foreground: blocks until done (original behavior).
+    zeroshot run "$full_task" ${passthru[@]+"${passthru[@]}"} || exit_code=$?
+  fi
+
+  echo ""
+  if [[ $exit_code -ne 0 ]]; then
+    warn "zeroshot exited with code ${exit_code}"
+  fi
+
+  # Post-run: ⑤ classify errors + ④ verification gate + capture lesson.
+  post_run_analysis "$task" "$cluster_id"
+}
+
+cmd_dry_run() {
+  ensure_jq
+  local task="${1:-}"
+  [[ -z "$task" ]] && die "Usage: zs-learn dry-run \"task description\""
+  shift
+
+  local lesson_ctx
+  lesson_ctx=$(build_lesson_context)
+
+  echo -e "${BOLD}═══ DRY RUN — what would be sent to zeroshot ═══${NC}"
+  echo ""
+
+  if [[ -n "$lesson_ctx" ]]; then
+    local n
+    n=$(count_unresolved)
+    echo -e "${YELLOW}── Injected lessons (${n} unresolved) ──${NC}"
+    echo "$lesson_ctx"
+    echo -e "${YELLOW}── End lessons ──${NC}"
+    echo ""
+    echo -e "${DIM}---${NC}"
+    echo ""
+  else
+    echo -e "${GREEN}(no prior failures — clean run)${NC}"
+    echo ""
+  fi
+
+  echo -e "${CYAN}── Original task ──${NC}"
+  echo "$task"
+  echo ""
+  echo -e "${DIM}Additional flags: $*${NC}"
+}
+
+cmd_lessons() {
+  ensure_jq
+  ensure_lessons_file
+
+  local show_all=false
+  [[ "${1:-}" == "--all" ]] && show_all=true
+
+  local filter='select(.resolved == false)'
+  [[ "$show_all" == "true" ]] && filter='.'
+
+  local count
+  count=$(jq -s "[.[] | ${filter}] | length" "$LESSONS_FILE" 2>/dev/null || echo 0)
+
+  if [[ "$count" -eq 0 ]]; then
+    if [[ "$show_all" == "true" ]]; then
+      info "No lessons recorded yet"
+    else
+      info "No unresolved lessons"
+    fi
+    return
+  fi
+
+  echo -e "${BOLD}═══ Lessons (${count}) ═══${NC}"
+  echo ""
+
+  jq -s "[.[] | ${filter}] | reverse | .[]" "$LESSONS_FILE" 2>/dev/null | jq -r '
+    "  [\(.id)] \(.failure_class | ascii_upcase)  \(.ts)\n" +
+    "    task:   \(.task)\n" +
+    "    cause:  \(.root_cause // .verifier_finding // "?")\n" +
+    "    lesson: \(.lesson // "?")\n" +
+    "    status: \(if .resolved then "resolved" else "ACTIVE" end)\n"
+  '
+}
+
+cmd_resolve() {
+  ensure_jq
+  ensure_lessons_file
+  local target_id="${1:-}"
+  [[ -z "$target_id" ]] && die "Usage: zs-learn resolve <lesson-id>"
+
+  if ! jq -e --arg id "$target_id" 'select(.id == $id)' "$LESSONS_FILE" &>/dev/null; then
+    die "Lesson '${target_id}' not found. Run: zs-learn lessons --all"
+  fi
+
+  local tmpfile
+  tmpfile=$(mktemp)
+  while IFS= read -r line; do
+    local lid
+    lid=$(echo "$line" | jq -r '.id')
+    if [[ "$lid" == "$target_id" ]]; then
+      echo "$line" | jq '.resolved = true' >> "$tmpfile"
+    else
+      echo "$line" >> "$tmpfile"
+    fi
+  done < "$LESSONS_FILE"
+  mv "$tmpfile" "$LESSONS_FILE"
+  ok "Lesson [${target_id}] marked as resolved"
+}
+
+cmd_clear() {
+  ensure_lessons_file
+  local count
+  count=$(wc -l < "$LESSONS_FILE" | tr -d ' ')
+  : > "$LESSONS_FILE"
+  ok "Cleared ${count} lesson(s)"
+}
+
+# Reap lessons from finished FAILED clusters that don't have a lesson yet.
+# This is the safety net that makes fire-and-forget loop mode reliable: even if
+# a task finishes long after you closed the REPL, its failure is still learned.
+cmd_harvest() {
+  ensure_jq
+  ensure_lessons_file
+  info "Harvesting lessons from finished clusters..."
+  local clusters
+  clusters=$(zeroshot list --json 2>/dev/null | jq -c '.clusters[]?' 2>/dev/null || true)
+  if [[ -z "$clusters" ]]; then
+    info "No clusters found — nothing to harvest"
+    return 0
+  fi
+  local harvested=0 skipped=0
+  local c cid cstate
+  while IFS= read -r c; do
+    [[ -z "$c" ]] && continue
+    cid=$(echo "$c" | jq -r '.id // empty')
+    [[ -z "$cid" ]] && continue
+    cstate=$(echo "$c" | jq -r '.state // .status // "?"')
+    # Only clear-failure terminal states (zombie is the common infra/auth failure).
+    case "$cstate" in
+      failed|zombie|corrupted|error|rejected) ;;
+      *) skipped=$((skipped+1)); continue ;;
+    esac
+    # Dedup: skip clusters that already produced a lesson.
+    if jq -e --arg id "$cid" 'select(.cluster_id == $id)' "$LESSONS_FILE" &>/dev/null; then
+      skipped=$((skipped+1)); continue
+    fi
+    echo ""
+    info "Harvesting failed cluster ${cid} (state=${cstate})"
+    extract_and_store_lesson "(harvested from cluster ${cid})" "$cid"
+    harvested=$((harvested+1))
+  done <<< "$clusters"
+  # ② Reconcile pending runs whose waiter died before capturing their lesson.
+  reconcile_pending
+  echo ""
+  ok "Harvest complete: ${harvested} new lesson(s), ${skipped} skipped"
+}
+
+# Fire-and-forget launch for loop mode: inject lessons, run detached, print the
+# cluster id + monitor hints, and return at once (no waiting).
+launch_detached() {
+  local task="$1"; shift
+  local lesson_ctx full_task
+  lesson_ctx=$(build_lesson_context)
+  full_task="$task"
+  [[ -n "$lesson_ctx" ]] && full_task="${lesson_ctx}"$'\n'"---"$'\n\n'"${task}"
+  local run_output cluster_id
+  run_output=$(zeroshot run "$full_task" --detach "$@" 2>&1) || true
+  cluster_id=$(echo "$run_output" | { grep -oE 'Started [a-zA-Z0-9-]+' || true; } | awk '{print $2}' | head -1)
+  if [[ -n "$cluster_id" ]]; then
+    record_pending "$cluster_id" "$task"   # ② durable: track for harvest reconciliation
+    ok "Launched → ${cluster_id}"
+    echo -e "  ${DIM}logs: zeroshot logs ${cluster_id} -f   |   attach: zeroshot attach ${cluster_id}${NC}"
+  else
+    warn "Launch may have failed. zeroshot output:"
+    echo "$run_output" | sed 's/^/    /'
+  fi
+}
+
+_loop_help() {
+  echo -e "${DIM}  <task text>                 run a task in the background (just type it)${NC}"
+  echo -e "${DIM}  flags <zeroshot flags...>   set persistent session flags (e.g. flags --worktree)${NC}"
+  echo -e "${DIM}  flags                       show current session flags${NC}"
+  echo -e "${DIM}  lessons | status | harvest  inspect lessons / clusters / reap lessons now${NC}"
+  echo -e "${DIM}  help                        this help${NC}"
+  echo -e "${DIM}  exit / quit                 leave (running tasks keep going)${NC}"
+}
+
+# Interactive loop mode: enter once, then just type tasks. Each task fires in the
+# background and the prompt returns immediately, so you can queue many long tasks.
+cmd_loop() {
+  ensure_jq
+  ensure_lessons_file
+  # Reap lessons from earlier fire-and-forget tasks before starting.
+  cmd_harvest
+  echo ""
+  echo -e "${BOLD}═══ Zeroshot Loop Mode ═══${NC}"
+  echo -e "Type a task + Enter → it runs in the ${BOLD}background${NC}; the prompt returns at once."
+  echo -e "Fire as many ultra-long tasks as you like. Lessons are harvested automatically."
+  echo ""
+  _loop_help
+  echo ""
+
+  local session_flags=()
+  local line f fdisp
+  while true; do
+    if ! IFS= read -r -p "loop> " line; then
+      echo ""
+      ok "Bye — running tasks continue in the background."
+      break
+    fi
+    # Trim leading/trailing whitespace (bash 3.2-safe).
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+
+    # Handle exit first (its `break` must not be swallowed by the error guard).
+    case "$line" in
+      exit|quit|:q|q)
+        ok "Bye — running tasks continue in the background."
+        break
+        ;;
+    esac
+
+    # Dispatch the rest; guard against set -e so one bad command won't kill the REPL.
+    case "$line" in
+      help|\?)
+        _loop_help
+        ;;
+      lessons)
+        cmd_lessons
+        ;;
+      status|list|clusters)
+        zeroshot list || true
+        ;;
+      harvest)
+        cmd_harvest
+        ;;
+      flags|"flags "*)
+        f="${line#flags}"
+        f="${f#"${f%%[![:space:]]*}"}"
+        if [[ -z "$f" ]]; then
+          fdisp="(none)"
+          [[ ${#session_flags[@]} -gt 0 ]] && fdisp="${session_flags[*]}"
+          info "Session flags: ${fdisp}"
+        else
+          session_flags=($f)
+          ok "Session flags set: ${session_flags[*]}"
+        fi
+        ;;
+      *)
+        launch_detached "$line" ${session_flags[@]+"${session_flags[@]}"}
+        ;;
+    esac || warn "(that command errored; continuing)"
+  done
+}
+
+cmd_help() {
+  cat <<'EOF'
+zs-learn — Failure Learning Layer for Zeroshot
+
+USAGE:
+  zs-learn loop                             Interactive mode — just type tasks (background)
+  zs-learn run "task" [zeroshot flags...]   Run one task (background by default; --fg for fg)
+  zs-learn harvest                          Reap lessons from finished failed clusters
+  zs-learn dry-run "task" [flags...]        Show injected context without running
+  zs-learn lessons [--all]                  List unresolved (or all) lessons
+  zs-learn resolve <id>                     Mark a lesson as resolved
+  zs-learn clear                            Delete all lessons for this project
+  zs-learn help                             Show this help
+
+LOOP MODE (zs-learn loop):
+  Enter once, then just type each task and press Enter — it runs in the
+  background and the prompt returns immediately, so you can queue many
+  ultra-long tasks. Lessons from finished failures are harvested automatically
+  (on startup, and via `harvest`). In-loop commands:
+    flags --worktree --provider opencode   set persistent session flags
+    lessons | status | harvest | help | exit
+
+DETACH (BACKGROUND) MODE — DEFAULT:
+  `zs-learn run` runs in the BACKGROUND by default (--detach), built for
+  ultra-long tasks: your terminal stays free and nothing gets orphaned.
+  zs-learn waits for the cluster to finish, then captures any lesson.
+    --fg / --foreground / --no-detach   Run attached in the foreground instead.
+  While a task is running you can:
+    zeroshot logs <id> -f      follow live logs
+    zeroshot attach <id>       attach to the running cluster
+
+EXAMPLES:
+  zs-learn run "Add JWT refresh endpoint" --worktree --provider opencode
+  zs-learn run "Quick local tweak" --fg          # foreground (short tasks)
+  zs-learn dry-run "Fix the auth bug"
+  zs-learn lessons
+  zs-learn resolve a1b2
+
+HOW IT WORKS:
+  1. Before each run, unresolved lessons are injected into the task prompt
+  2. Zeroshot runs the executor-verifier loop as normal
+  3. If the run is REJECTED, the failure is classified and stored as a lesson
+  4. If the run is APPROVED, matching lessons are auto-resolved
+  5. Next run benefits from accumulated failure knowledge
+
+LESSON STORAGE:
+  .zeroshot/lessons.jsonl  (per-project, one JSON object per line)
+EOF
+}
+
+# ── Main ────────────────────────────────────────────────────────────────
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    loop)     cmd_loop "$@" ;;
+    run)      cmd_run "$@" ;;
+    harvest)  cmd_harvest "$@" ;;
+    dry-run)  cmd_dry_run "$@" ;;
+    lessons)  cmd_lessons "$@" ;;
+    resolve)  cmd_resolve "$@" ;;
+    clear)    cmd_clear "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)        die "Unknown command: ${cmd}. Run: zs-learn help" ;;
+  esac
+}
+
+main "$@"
