@@ -189,7 +189,12 @@ async def run_cluster(inp: RunClusterInput) -> ClusterOutcome:
         if outcome is not None:
             # Anti-garbage: delete this cluster's opencode sessions now that it's done.
             if inp.clean_sessions:
-                deleted = await zeroshot_lib.cleanup_cluster_sessions(cluster_id)
+                created_at = await zeroshot_lib.get_cluster_created_at(cluster_id, cwd)
+                deleted = await zeroshot_lib.cleanup_cluster_sessions(
+                    cluster_id,
+                    project_dir=inp.project_dir,
+                    cluster_created_at=created_at,
+                )
                 if deleted:
                     activity.logger.info(
                         "Cleaned up %d opencode session(s) for cluster %s",

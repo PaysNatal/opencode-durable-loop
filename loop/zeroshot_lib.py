@@ -49,6 +49,19 @@ async def get_cluster_state(cluster_id: str, cwd: str) -> tuple[str, int]:
     return ("", 0)  # not found
 
 
+async def get_cluster_created_at(cluster_id: str, cwd: str) -> int:
+    """Return the cluster's createdAt timestamp (ms) via `zeroshot list --json`, or 0."""
+    output = await _run(["zeroshot", "list", "--json"], cwd)
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        return 0
+    for c in data.get("clusters", []):
+        if c.get("id") == cluster_id:
+            return int(c.get("createdAt") or 0)
+    return 0
+
+
 async def get_status_json(cluster_id: str, cwd: str) -> dict:
     """Return the parsed `zeroshot status <id> --json` object ({} on failure)."""
     output = await _run(["zeroshot", "status", cluster_id, "--json"], cwd)
@@ -78,25 +91,47 @@ async def kill_cluster(cluster_id: str, cwd: str) -> None:
     await _run(["zeroshot", "kill", cluster_id], cwd)
 
 
-async def cleanup_cluster_sessions(cluster_id: str) -> int:
-    """Delete opencode sessions created in the cluster's worktree (loop garbage).
+async def cleanup_cluster_sessions(
+    cluster_id: str, project_dir: str = "", cluster_created_at: int = 0
+) -> int:
+    """Delete opencode sessions created by a loop cluster (loop garbage).
 
-    Each zeroshot cluster runs opencode (conductor/planner/worker/validators)
-    inside ~/.zeroshot/worktrees/<cluster-id>; those sessions linger in
-    opencode.db after the cluster finishes. This removes them so the session
-    store doesn't fill up. Best-effort: never raises, returns count deleted.
+    Zeroshot runs opencode agents (conductor/planner/worker/validators) which
+    create sessions in opencode.db.  In zeroshot >= 6.12 these sessions live in
+    the *project directory* (not in ~/.zeroshot/worktrees/).  We identify them
+    by project directory + creation-time window, plus reformat title patterns.
+
+    Best-effort: never raises, returns count deleted.
     """
     if not re.fullmatch(r"[A-Za-z0-9-]+", cluster_id or ""):
         return 0  # sanity guard against SQL injection via cluster_id
     db = os.path.expanduser("~/.local/share/opencode/opencode.db")
     if not os.path.exists(db):
         return 0
-    pattern = f"%/.zeroshot/worktrees/{cluster_id}%"
+
+    # Build the WHERE clause:
+    #   1. Legacy: sessions in the old worktree path (zeroshot < 6.12)
+    #   2. New: sessions in the project directory created after the cluster started
+    #   3. Reformat sessions (title pattern) created after the cluster started
+    conditions = [f"directory LIKE '%/.zeroshot/worktrees/{cluster_id}%'"]
+    if project_dir and cluster_created_at:
+        proj = project_dir.replace("'", "''")
+        conditions.append(
+            f"(directory = '{proj}' AND time_created >= {cluster_created_at})"
+        )
+        conditions.append(
+            f"(title LIKE '%Text-to-JSON%' AND time_created >= {cluster_created_at})"
+        )
+        conditions.append(
+            f"(title LIKE '%Text to JSON%' AND time_created >= {cluster_created_at})"
+        )
+    where = " OR ".join(conditions)
+
     try:
         proc = await asyncio.create_subprocess_exec(
             "sqlite3",
             db,
-            f"SELECT id FROM session WHERE directory LIKE '{pattern}';",
+            f"SELECT id FROM session WHERE {where};",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )

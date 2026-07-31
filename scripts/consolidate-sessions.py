@@ -29,12 +29,17 @@ DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
 GAP_MIN = 30  # start a new group when the gap between consecutive sessions exceeds this
 
 # Titles that mark a session as a loop-INTERNAL fragment (never a real user session).
+# Updated for zeroshot >= 6.12 agent roles (orchestrator, coordinator) and
+# reformat session titles (Text-to-JSON / Text to JSON).
 INTERNAL = [
     "conductor",
     "classification",
     "validator prompt",
     "validation prompt",
     "text-to-json",
+    "text to json",
+    "orchestrator",
+    "coordinator",
 ]
 
 
