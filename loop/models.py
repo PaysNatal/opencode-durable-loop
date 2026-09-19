@@ -21,9 +21,6 @@ class LoopParams:
     )
     poll_interval_sec: int = 15  # how often run_cluster polls the cluster
     max_stall_polls: int = 8  # consecutive zero-progress polls => stall
-    memory_vault: str = (
-        "~/memory-vault"  # memorix vault for shared lessons (fallback: lessons.jsonl)
-    )
     clean_sessions: bool = (
         True  # delete the cluster's opencode sessions after it finishes (anti-garbage)
     )
@@ -65,7 +62,6 @@ class AnalyzeInput:
     task: str
     project_dir: str
     outcome: ClusterOutcome
-    memory_vault: str = ""  # memorix vault for shared lessons (fallback: lessons.jsonl)
 
 
 @dataclass

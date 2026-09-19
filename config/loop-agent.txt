@@ -13,7 +13,7 @@ You also maintain a failure memory: past failures are injected into future runs 
 - **dloop** (Temporal-backed, DURABLE) — the default for ultra-long / unattended tasks. The run
   survives crashes and terminal closes (Temporal durable execution), has a native heartbeat watchdog
   (auto-kills stalled clusters), error-classified retries (fails fast on auth/permission errors), and
-  stores lessons in a shared memorix vault (`~/memory-vault`) so learning works across all projects.
+  accumulates lessons per project (`.zeroshot/lessons.jsonl`) so retries learn from prior failures.
 - **zs-learn** (bash) — lighter weight; fine for shorter tasks or when you want to block in the foreground.
 
 Both wrap Zeroshot (the multi-agent executor). **Prefer dloop for anything long-running or unattended.**
@@ -59,7 +59,7 @@ dloop "task" --detach -- --worktree --provider opencode   # fire-and-forget dura
 dloop "task" -- --worktree --provider opencode            # run and WAIT for the result
 dloop "task" --max-iterations 5 --detach -- --worktree    # more executor-verifier retries
 #   dloop options (BEFORE '--'): --project-dir DIR, --max-iterations N, --run-timeout-min N,
-#     --heartbeat-timeout-sec N, --memory-vault DIR, --detach
+#     --heartbeat-timeout-sec N, --detach
 #   zeroshot flags go AFTER '--' (passed verbatim, e.g. --worktree --provider opencode)
 
 # Monitor a durable loop (Temporal)
@@ -114,4 +114,4 @@ Use `--provider opencode` by default. Only switch if the user explicitly asks.
 7. For long-running / unattended tasks, use `dloop "task" --detach ...` — it runs durably (survives
    crashes / terminal close) and frees the terminal. zs-learn `-d` is the lighter alternative.
 8. If the user asks about past failures or lessons, run `zs-learn lessons` and summarize. (dloop stores
-   lessons in the shared memorix vault `~/memory-vault`, so they apply across all projects.)
+   lessons in the project's local lesson log, so they apply to that project on future runs.)

@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # Install the opencode durable loop:
-#   1. Check dependencies (temporal CLI, zeroshot, opencode, python3, jq, memorix).
+#   1. Check dependencies (temporal CLI, zeroshot, opencode, python3, jq).
 #   2. Install Python deps (temporalio).
 #   3. Apply the zeroshot opencode reformatting patch.
 #   4. Link dloop + zs-learn into ~/.local/bin.
-#   5. Set up the memorix memory vault (~/memory-vault git repo).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJ_DIR="$(dirname "$SCRIPT_DIR")"
 BIN_DIR="${DLOOP_BIN_DIR:-$HOME/.local/bin}"
-VAULT="${DLOOP_MEMORY_VAULT:-$HOME/memory-vault}"
 
 echo "═══ opencode-durable-loop installer ═══"
 
@@ -26,7 +24,6 @@ need zeroshot "npm install -g @the-open-engine/zeroshot"
 need opencode "see https://opencode.ai"
 need python3  "install Python 3.10+"
 need jq       "brew install jq"
-need memorix  "npm install -g memorix  (optional: cross-project lesson memory)"
 if [[ "$MISSING" == "1" ]]; then
   echo "Install the missing dependencies first, then re-run." >&2
   exit 1
@@ -50,19 +47,6 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) echo "  ⚠ $BIN_DIR is not in PATH — add: export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
-
-# 5. memorix memory vault ---------------------------------------------------
-if [[ -d "$VAULT/.git" ]]; then
-  echo "  ✓ memory vault exists: $VAULT"
-else
-  echo "▸ Creating memorix memory vault at $VAULT..."
-  mkdir -p "$VAULT"
-  git -C "$VAULT" init -q
-  echo "# Memorix memory vault for the durable loop" > "$VAULT/README.md"
-  git -C "$VAULT" add README.md
-  git -C "$VAULT" -c user.email=loop@local -c user.name=loop commit -qm "init memory vault" || true
-  echo "  ✓ created $VAULT"
-fi
 
 echo ""
 echo "✓ Installed. Try:  dloop \"your task\" --detach"

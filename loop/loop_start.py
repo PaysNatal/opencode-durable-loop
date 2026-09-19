@@ -44,11 +44,6 @@ async def main():
     p.add_argument("--poll-interval-sec", type=int, default=15)
     p.add_argument("--max-stall-polls", type=int, default=8)
     p.add_argument(
-        "--memory-vault",
-        default=os.path.expanduser("~/memory-vault"),
-        help="Memorix vault for shared lessons (default ~/memory-vault; falls back to lessons.jsonl if not a git repo)",
-    )
-    p.add_argument(
         "--keep-sessions",
         action="store_true",
         help="Keep the cluster's opencode sessions (default deletes them to avoid garbage)",
@@ -69,7 +64,6 @@ async def main():
         heartbeat_timeout_sec=args.heartbeat_timeout_sec,
         poll_interval_sec=args.poll_interval_sec,
         max_stall_polls=args.max_stall_polls,
-        memory_vault=args.memory_vault,
         clean_sessions=not args.keep_sessions,
     )
 

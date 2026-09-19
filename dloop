@@ -35,7 +35,6 @@ dloop options:
   --max-iterations N         Max executor-verifier iterations (default 3)
   --run-timeout-min N        Per-run timeout in minutes (default 30)
   --heartbeat-timeout-sec N  Heartbeat timeout in seconds (default 90)
-  --memory-vault DIR         Memorix vault for shared lessons (default ~/memory-vault)
   --detach                   Start and return immediately (runs durably in background)
   --flag <zeroshot-flag>     Extra zeroshot flag, repeatable (or use '--' below)
 
